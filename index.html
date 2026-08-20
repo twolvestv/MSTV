@@ -256,8 +256,15 @@
     // =========================================================
 
     const DOC_URL = "https://docs.google.com/document/d/e/2PACX-1vT41C1yHBRLFjwbRGg1FhYic_Wsnq0Gw97iryN2-S6my9inn6yqJIZ_zGQOnM6WjqXwIlceF9e74w8b/pub";
-    const PROXY_URL = "https://r.jina.ai/" + DOC_URL;
     const REFRESH_MS = 5 * 60 * 1000; // 5 minutes, matches the doc's own update cadence
+
+    // r.jina.ai caches its own responses per-URL for a few minutes. Appending
+    // a changing query param each time (same trick used below for the
+    // announcements iframe) makes every request a unique URL, so Jina can't
+    // serve a stale cached copy back to us.
+    function buildProxyUrl() {
+      return "https://r.jina.ai/" + DOC_URL + "?cb=" + Date.now();
+    }
 
     // Fallback text, captured from the live doc as of setup time.
     // Only shown if the live fetch fails.
@@ -305,7 +312,7 @@
     }
 
     function fetchBulletin() {
-      fetch(PROXY_URL)
+      fetch(buildProxyUrl())
         .then(res => {
           if (!res.ok) throw new Error('Bad response');
           return res.text();
