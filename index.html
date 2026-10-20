@@ -83,6 +83,20 @@
     object-fit: fill;
   }
 
+  /* Animated glow layer drawn on top of the welcome image (see
+     WELCOME GLOW in the script). If WebGL isn't available, the canvas
+     never gets the "on" class and the plain image shows instead. */
+  #welcome-glow {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: none;
+  }
+  #slide-welcome.glow-on #welcome-glow { display: block; }
+  #slide-welcome.glow-on img { visibility: hidden; }
+
  /* ---- Bottom scrolling ticker ---- */
   .ticker-bar {
     position: absolute;
@@ -160,6 +174,7 @@
     <div class="slide" id="slide-welcome">
       
       <img src="Welcome_MS.png" alt="Southwest Valley Wolves Logo" onerror="this.dataset.broken='true';">
+      <canvas id="welcome-glow"></canvas>
     </div>
 
     <div class="slide" id="slide-announcements">
@@ -262,7 +277,224 @@
       setTimeout(nextSlide, slides[current].duration);
     }
 
-    setTimeout(nextSlide, slides[current].duration);
+    // Preview helper: open the page with #welcome on the end of the URL
+    // to park on the welcome slide (no rotation) while tweaking the glow.
+    if (location.hash === '#welcome') {
+      current = slides.findIndex(s => s.el.id === 'slide-welcome');
+      showSlide(current);
+    } else {
+      setTimeout(nextSlide, slides[current].duration);
+    }
+
+    // =========================================================
+    // WELCOME GLOW: makes the welcome image look alive, borrowing
+    // the tricks flowiowa.com uses on its rivers:
+    //   - the wolf's eyes pulse
+    //   - a glowing shine sweeps across the lettering
+    // Everything is one WebGL pass per frame, and it only draws while
+    // the welcome slide is showing. If anything fails, the plain image
+    // stays up exactly as before.
+    // =========================================================
+    const GLOW = {
+      maxFps: 30,            // frame cap, easy on old Chromebooks (slow motion looks the same as 60)
+      sweepSeconds: 7,       // time between shine sweeps across the text
+      eyeSeconds: 3,         // eye pulse cycle
+      eyes: [[0.269, 0.451], [0.361, 0.463]], // eye centres, as fraction of image width/height
+      wolf: [0.29, 0.47, 0.18, 0.36],          // wolf head ellipse (cx, cy, rx, ry): its white fur shouldn't bloom
+      textBox: [0.48, 0.15, 0.94, 0.86]        // area holding the lettering (x0, y0, x1, y1)
+    };
+
+    function startWelcomeGlow() {
+      const slide = document.getElementById('slide-welcome');
+      const img = slide.querySelector('img');
+      const canvas = document.getElementById('welcome-glow');
+      const W = img.naturalWidth, H = img.naturalHeight;
+      if (!W || !H) return;
+
+      const gl = canvas.getContext('webgl', { alpha: false, antialias: false });
+      if (!gl) return;
+      canvas.width = W;
+      canvas.height = H;
+
+      // --- Build the glow halo once; the shader shows it under the text shine ---
+      // Work at quarter size: it gets blurred heavily anyway.
+      const gw = Math.round(W / 4), gh = Math.round(H / 4);
+      const src = document.createElement('canvas');
+      src.width = gw; src.height = gh;
+      const sctx = src.getContext('2d');
+      sctx.drawImage(img, 0, 0, gw, gh);
+      const px = sctx.getImageData(0, 0, gw, gh); // throws when opened as a local file
+      const d = px.data;
+      const [wcx, wcy, wrx, wry] = GLOW.wolf;
+      for (let y = 0; y < gh; y++) {
+        for (let x = 0; x < gw; x++) {
+          const i = (y * gw + x) * 4;
+          const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+          const teal = Math.min(1, Math.max(0, (g - r - 0.1) * 5)) * (g > 0.25 ? 1 : 0);
+          const dx = (x / gw - wcx) / wrx, dy = (y / gh - wcy) / wry;
+          const inWolf = dx * dx + dy * dy < 1;
+          const white = !inWolf && Math.min(r, g, b) > 0.8 ? 1 : 0;
+          d[i]     = 255 * Math.min(1, teal * 0.15 + white * 0.75);
+          d[i + 1] = 255 * Math.min(1, teal * 0.55 + white * 0.95);
+          d[i + 2] = 255 * Math.min(1, teal * 0.52 + white * 1.0);
+          d[i + 3] = 255;
+        }
+      }
+      sctx.putImageData(px, 0, 0);
+      // Sum a few blur sizes: tight glow + wide soft haze, like a bloom chain.
+      const glowCanvas = document.createElement('canvas');
+      glowCanvas.width = gw; glowCanvas.height = gh;
+      const gctx = glowCanvas.getContext('2d');
+      gctx.fillStyle = '#000';
+      gctx.fillRect(0, 0, gw, gh);
+      gctx.globalCompositeOperation = 'lighter';
+      [[2, 0.35], [6, 0.3], [14, 0.3], [30, 0.3]].forEach(([radius, weight]) => {
+        gctx.filter = `blur(${radius}px)`;
+        gctx.globalAlpha = weight;
+        gctx.drawImage(src, 0, 0);
+      });
+
+      // --- WebGL setup ---
+      const vs = `
+        attribute vec2 a_pos;
+        varying vec2 v_uv;
+        void main() {
+          v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+          gl_Position = vec4(a_pos, 0.0, 1.0);
+        }`;
+      const fs = `
+        // Use full precision where the graphics chip has it. Everything
+        // below is also written to look right on chips that only do
+        // low-precision math (common on old Chromebooks): no big numbers,
+        // and all timing is pre-wrapped in JavaScript.
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+          precision highp float;
+        #else
+          precision mediump float;
+        #endif
+        uniform sampler2D u_img;
+        uniform sampler2D u_glow;
+        uniform float u_aspect;
+        uniform vec2 u_eye1;
+        uniform vec2 u_eye2;
+        uniform vec4 u_textBox;
+        uniform float u_sweep;   // 0..1 position of the text shine
+        uniform float u_eye;     // 0..1
+        varying vec2 v_uv;
+
+        void main() {
+          vec3 base = texture2D(u_img, v_uv).rgb;
+          vec3 glow = texture2D(u_glow, v_uv).rgb;
+          vec2 p = vec2(v_uv.x * u_aspect, v_uv.y);
+          float teal = clamp((base.g - base.r - 0.1) * 5.0, 0.0, 1.0) * step(0.25, base.g);
+          vec3 c = base;
+
+          // Shine sweeping diagonally across the lettering.
+          vec4 tb = u_textBox;
+          float inText = smoothstep(tb.x, tb.x + 0.04, v_uv.x) * (1.0 - smoothstep(tb.z - 0.04, tb.z, v_uv.x))
+                       * smoothstep(tb.y, tb.y + 0.04, v_uv.y) * (1.0 - smoothstep(tb.w - 0.04, tb.w, v_uv.y));
+          float s = (v_uv.x - tb.x) / (tb.z - tb.x) + (v_uv.y - tb.y) * 0.35;
+          float sd = (s - (u_sweep * 2.2 - 0.4)) / 0.07;
+          float band = exp(-sd * sd);
+          c += inText * glow * band * 1.4;
+          c += inText * teal * band * vec3(0.4, 0.6, 0.6);
+
+          // Eyes: teal glow that swells and fades.
+          float eb = u_eye * u_eye;
+          vec2 e1 = vec2(u_eye1.x * u_aspect, u_eye1.y);
+          vec2 e2 = vec2(u_eye2.x * u_aspect, u_eye2.y);
+          float d1 = distance(p, e1), d2 = distance(p, e2);
+          vec2 h = vec2(d1, d2) / 0.0187;   // halo radius
+          vec2 k = vec2(d1, d2) / 0.0063;   // bright core radius
+          float halo = exp(-h.x * h.x) + exp(-h.y * h.y);
+          float core = exp(-k.x * k.x) + exp(-k.y * k.y);
+          c += vec3(0.2, 0.95, 0.9) * (halo * (0.15 + 0.55 * eb) + core * teal * 0.8 * eb);
+
+          gl_FragColor = vec4(min(c, vec3(1.0)), 1.0);
+        }`;
+
+      function compile(type, source) {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, source);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+        return sh;
+      }
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+      gl.useProgram(prog);
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(prog, 'a_pos');
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+      function texture(unit, source) {
+        const t = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, source);
+      }
+      texture(0, img);
+      texture(1, glowCanvas);
+
+      const u = name => gl.getUniformLocation(prog, name);
+      gl.uniform1i(u('u_img'), 0);
+      gl.uniform1i(u('u_glow'), 1);
+      gl.uniform1f(u('u_aspect'), W / H);
+      gl.uniform2fv(u('u_eye1'), GLOW.eyes[0]);
+      gl.uniform2fv(u('u_eye2'), GLOW.eyes[1]);
+      gl.uniform4fv(u('u_textBox'), GLOW.textBox);
+      const uSweep = u('u_sweep'), uEye = u('u_eye');
+      gl.viewport(0, 0, W, H);
+
+      // Work out every animation phase here (JavaScript has full precision)
+      // and wrap it into a small range, so weak graphics chips never see
+      // large numbers that they'd round into stripes or stutter.
+      const TAU = Math.PI * 2;
+      const wrap = (x, m) => ((x % m) + m) % m;
+      const cycle = (t, seconds) => 0.5 + 0.5 * Math.sin(wrap(t / seconds, 1) * TAU);
+      function setTime(t) {
+        gl.uniform1f(uSweep, wrap(t / GLOW.sweepSeconds, 1));
+        gl.uniform1f(uEye, cycle(t, GLOW.eyeSeconds));
+      }
+
+      const t0 = performance.now();
+      const FRAME_MS = 1000 / GLOW.maxFps;
+      let lastDraw = 0;
+      function frame(now) {
+        requestAnimationFrame(frame);
+        if (!slide.classList.contains('active')) return; // idle while other slides show
+        if (now - lastDraw < FRAME_MS - 2) return;        // frame cap (small slack absorbs timer jitter)
+        lastDraw = now;
+        setTime((now - t0) / 1000);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+      // Draw one frame before revealing so there's no black flash.
+      setTime(0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      slide.classList.add('glow-on');
+      requestAnimationFrame(frame);
+    }
+
+    (function initWelcomeGlow() {
+      const img = document.querySelector('#slide-welcome img');
+      const go = () => {
+        try { startWelcomeGlow(); }
+        catch (err) { console.warn('Welcome glow disabled, showing plain image.', err); }
+      };
+      if (img.complete && img.naturalWidth) go();
+      else img.addEventListener('load', go, { once: true });
+    })();
 
     // =========================================================
     // BOTTOM TICKER: pulls text from the published "Daily Bulletin"
